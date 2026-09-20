@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
-import { getDbPool, getDatabaseProvider, initializeDatabaseSchema } from '@/lib/db';
+import { getDbPool, getDatabaseProvider, initializeDatabaseSchema, resetDbHealth, markDbUnhealthy } from '@/lib/db';
 import { isSupabaseConfigured } from '@/lib/supabase';
 
 export async function GET() {
   const provider = getDatabaseProvider();
-  const pool = getDbPool();
+  const pool = getDbPool({ force: true });
   const supabaseConfigured = isSupabaseConfigured();
 
   let connected = false;
@@ -23,11 +23,13 @@ export async function GET() {
         `);
         tablesCount = res.rows.length;
         connected = true;
+        resetDbHealth();
       } finally {
         client.release();
       }
     } catch (err: any) {
       error = err?.message || 'Database connection error';
+      markDbUnhealthy(err);
     }
   }
 
@@ -44,9 +46,12 @@ export async function GET() {
 }
 
 export async function POST() {
+  resetDbHealth();
   const success = await initializeDatabaseSchema();
   return NextResponse.json({
     success,
-    message: success ? 'Database schema initialized successfully in Supabase/PostgreSQL.' : 'Schema initialization skipped (no DATABASE_URL configured).',
+    message: success
+      ? 'Database schema initialized successfully in Supabase/PostgreSQL.'
+      : 'Schema initialization skipped (unreachable database host or no DATABASE_URL configured). Running in in-memory mode.',
   });
 }

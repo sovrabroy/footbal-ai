@@ -1,19 +1,17 @@
 import { Match, League, Team, PredictionResult, PredictionModelWeights, StandingRow, TopScorer } from '@/types/football';
 import {
-  INITIAL_MATCHES,
   LEAGUES,
   TEAMS,
   HISTORICAL_PREDICTION_RESULTS,
   STANDINGS_DATA,
   TOP_SCORERS,
-  getH2H,
   createInitialMatches,
 } from '@/data/mockFootballData';
 import { calculateMatchPrediction } from '@/services/predictionService';
 import { getStoredWeights } from '@/lib/predictionConfig';
-import { getTodayDateString, isMatchToday } from '@/lib/dateUtils';
+import { getTodayDateString } from '@/lib/dateUtils';
 
-// In-memory / Session state manager
+// In-memory / Session state manager with durable localStorage persistence
 class FootballDataStore {
   private matches: Match[] = [];
   private leagues: League[] = [];
@@ -39,26 +37,37 @@ class FootballDataStore {
     if (typeof window === 'undefined') return {};
 
     try {
+      const demoCleared = localStorage.getItem('goalpredict_demo_cleared') === 'true';
       const localMatches = localStorage.getItem('goalpredict_matches');
-      const lastSyncDate = localStorage.getItem('goalpredict_sync_date');
-      const todayStr = getTodayDateString();
 
       let loadedMatches: Match[] | undefined;
-      if (localMatches && lastSyncDate === todayStr) {
-        const parsed = JSON.parse(localMatches);
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed.some((m: Match) => isMatchToday(m.date))) {
-          this.matches = parsed;
-          loadedMatches = parsed;
+      if (localMatches) {
+        try {
+          const parsed = JSON.parse(localMatches);
+          if (Array.isArray(parsed)) {
+            this.matches = parsed;
+            loadedMatches = parsed;
+          }
+        } catch {
+          // ignore
         }
+      } else if (demoCleared) {
+        // User explicitly cleared all demo fixtures
+        this.matches = [];
+        loadedMatches = [];
       }
 
       const localResults = localStorage.getItem('goalpredict_results');
       let loadedResults: PredictionResult[] | undefined;
       if (localResults) {
-        const parsedResults = JSON.parse(localResults);
-        if (Array.isArray(parsedResults) && parsedResults.length > 0) {
-          this.results = parsedResults;
-          loadedResults = parsedResults;
+        try {
+          const parsedResults = JSON.parse(localResults);
+          if (Array.isArray(parsedResults) && parsedResults.length > 0) {
+            this.results = parsedResults;
+            loadedResults = parsedResults;
+          }
+        } catch {
+          // ignore
         }
       }
 
@@ -75,6 +84,9 @@ class FootballDataStore {
       try {
         localStorage.setItem('goalpredict_matches', JSON.stringify(matches));
         localStorage.setItem('goalpredict_sync_date', getTodayDateString());
+        if (matches.length > 0) {
+          localStorage.removeItem('goalpredict_demo_cleared');
+        }
       } catch (e) {
         console.warn('Could not persist matches to localStorage:', e);
       }
@@ -165,6 +177,7 @@ class FootballDataStore {
     if (typeof window !== 'undefined') {
       try {
         localStorage.setItem('goalpredict_matches', JSON.stringify(this.matches));
+        localStorage.removeItem('goalpredict_demo_cleared');
       } catch (e) {
         console.warn('Failed to save added match to localStorage:', e);
       }
@@ -191,11 +204,28 @@ class FootballDataStore {
     if (typeof window !== 'undefined') {
       try {
         localStorage.setItem('goalpredict_matches', JSON.stringify(this.matches));
+        if (this.matches.length === 0) {
+          localStorage.setItem('goalpredict_demo_cleared', 'true');
+        }
       } catch (e) {
         console.warn('Failed to save deleted match to localStorage:', e);
       }
     }
     return true;
+  }
+
+  public async clearAllMatches(): Promise<void> {
+    this.init();
+    this.matches = [];
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('goalpredict_matches', JSON.stringify([]));
+        localStorage.setItem('goalpredict_demo_cleared', 'true');
+        localStorage.removeItem('goalpredict_sync_date');
+      } catch (e) {
+        console.warn('Failed to clear matches in localStorage:', e);
+      }
+    }
   }
 
   public async addResult(result: PredictionResult): Promise<void> {
@@ -210,7 +240,7 @@ class FootballDataStore {
     }
   }
 
-  public async resetData(): Promise<void> {
+  public async resetToDefaults(): Promise<Match[]> {
     this.matches = createInitialMatches();
     this.results = [...HISTORICAL_PREDICTION_RESULTS];
     if (typeof window !== 'undefined') {
@@ -218,47 +248,133 @@ class FootballDataStore {
         localStorage.removeItem('goalpredict_matches');
         localStorage.removeItem('goalpredict_results');
         localStorage.removeItem('goalpredict_sync_date');
+        localStorage.removeItem('goalpredict_demo_cleared');
       } catch (e) {
         console.warn('Failed to reset localStorage data:', e);
       }
     }
-  }
-
-  public async resetToDefaults(): Promise<void> {
-    return this.resetData();
+    return [...this.matches];
   }
 }
 
 export const footballDataStore = new FootballDataStore();
 
 class FootballApiService {
+  public getStoredCredentials(): { provider: string; apiKey: string; baseUrl: string } {
+    if (typeof window === 'undefined') {
+      return {
+        provider: 'api-football',
+        apiKey: '',
+        baseUrl: 'https://v3.football.api-sports.io',
+      };
+    }
+
+    const provider = localStorage.getItem('goalpredict_api_provider') || 'api-football';
+    const apiKey = localStorage.getItem('goalpredict_api_key') || '';
+    const baseUrl = localStorage.getItem('goalpredict_api_base_url') || 
+      (provider === 'football-data' ? 'https://api.football-data.org/v4' : 'https://v3.football.api-sports.io');
+
+    return { provider, apiKey, baseUrl };
+  }
+
+  public saveCredentials(provider: string, apiKey: string, baseUrl?: string): void {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('goalpredict_api_provider', provider);
+    localStorage.setItem('goalpredict_api_key', apiKey.trim());
+    if (baseUrl) {
+      localStorage.setItem('goalpredict_api_base_url', baseUrl.trim());
+    }
+  }
+
+  public async syncLiveFixtures(options: {
+    date?: string;
+    apiKey?: string;
+    provider?: string;
+    mode?: 'live' | 'auto';
+  } = {}): Promise<{
+    success: boolean;
+    matches: Match[];
+    source: string;
+    total: number;
+    error?: string;
+    message?: string;
+  }> {
+    const creds = this.getStoredCredentials();
+    const effectiveKey = options.apiKey !== undefined ? options.apiKey : creds.apiKey;
+    const effectiveProvider = options.provider || creds.provider || 'api-football';
+    const queryDate = options.date || getTodayDateString();
+    const mode = options.mode || 'live';
+
+    try {
+      const headers: Record<string, string> = {};
+      if (effectiveKey) {
+        headers['x-football-api-key'] = effectiveKey;
+      }
+      headers['x-football-provider'] = effectiveProvider;
+
+      const url = `/api/football/fixtures?date=${queryDate}&mode=${mode}&provider=${effectiveProvider}`;
+      const res = await fetch(url, { headers });
+      const json = await res.json();
+
+      if (json.success && Array.isArray(json.matches)) {
+        if (json.matches.length > 0) {
+          footballDataStore.setMatches(json.matches);
+        }
+        return {
+          success: true,
+          matches: json.matches,
+          source: json.source || effectiveProvider,
+          total: json.total || json.matches.length,
+          message: json.message,
+        };
+      } else {
+        return {
+          success: false,
+          matches: [],
+          source: 'error',
+          total: 0,
+          error: json.error || 'Failed to fetch live matches from football API',
+        };
+      }
+    } catch (err: any) {
+      return {
+        success: false,
+        matches: [],
+        source: 'error',
+        total: 0,
+        error: err?.message || 'Network error connecting to fixtures API',
+      };
+    }
+  }
+
   public async fetchMatches(date?: string): Promise<{
     matches: Match[];
-    source: 'api-football' | 'baseline';
+    source: 'api-football' | 'football-data' | 'baseline' | 'custom';
     total: number;
   }> {
     if (typeof window !== 'undefined') {
-      try {
-        const queryDate = date || getTodayDateString();
-        // Call our server-side API route (which talks to API-Football securely)
-        const res = await fetch(`/api/football/fixtures?date=${queryDate}`).catch(() =>
-          fetch(`/api/fixtures?date=${queryDate}`)
-        );
-        if (res.ok) {
-          const json = await res.json();
-          if (json.success && Array.isArray(json.matches) && json.matches.length > 0) {
-            footballDataStore.setMatches(json.matches);
-            return {
-              matches: json.matches,
-              source: json.source || 'baseline',
-              total: json.total || json.matches.length,
-            };
-          }
+      const demoCleared = localStorage.getItem('goalpredict_demo_cleared') === 'true';
+      const creds = this.getStoredCredentials();
+
+      // If user has saved a key, try live sync first
+      if (creds.apiKey) {
+        const syncResult = await this.syncLiveFixtures({ date, apiKey: creds.apiKey, provider: creds.provider, mode: 'auto' });
+        if (syncResult.success && syncResult.matches.length > 0) {
+          return {
+            matches: syncResult.matches,
+            source: syncResult.source as any,
+            total: syncResult.total,
+          };
         }
-      } catch (err) {
-        console.warn('Failed to fetch from server-side fixtures API, falling back to local store:', err);
+      }
+
+      // If demo was explicitly cleared, return what is in store (may be empty or user added)
+      if (demoCleared) {
+        const currentMatches = await footballDataStore.getMatches();
+        return { matches: currentMatches, source: 'custom', total: currentMatches.length };
       }
     }
+
     const fallback = await footballDataStore.getMatches();
     return { matches: fallback, source: 'baseline', total: fallback.length };
   }
@@ -289,10 +405,11 @@ class FootballApiService {
   }
 
   public getProviderInfo(): { provider: string; hasApiKey: boolean; baseUrl: string } {
+    const creds = this.getStoredCredentials();
     return {
-      provider: 'api-football',
-      hasApiKey: false,
-      baseUrl: 'https://v3.football.api-sports.io',
+      provider: creds.provider,
+      hasApiKey: !!creds.apiKey,
+      baseUrl: creds.baseUrl,
     };
   }
 }

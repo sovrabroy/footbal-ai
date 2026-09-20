@@ -11,22 +11,24 @@ import {
   RefreshCw,
   Save,
   RotateCcw,
-  CheckCircle2,
-  AlertCircle,
   Key,
-  Layers,
-  Settings,
   Calendar,
   Copy,
   Check,
   Terminal,
   Server,
   Sparkles,
+  Wifi,
+  CloudDownload,
+  AlertTriangle,
+  Globe,
+  Radio,
 } from 'lucide-react';
 import { Match, League, Team, PredictionModelWeights } from '@/types/football';
 import { DEFAULT_PREDICTION_WEIGHTS, saveStoredWeights, getStoredWeights } from '@/lib/predictionConfig';
 import { footballDataStore, footballApiService } from '@/services/footballApi';
 import { generateRandomCronSecret } from '@/lib/cronAuth';
+import { getTodayDateString, getTomorrowDateString } from '@/lib/dateUtils';
 import { useToast } from '@/components/ui/Toast';
 import { Badge } from '@/components/ui/Badge';
 import { Modal } from '@/components/ui/Modal';
@@ -47,7 +49,7 @@ export function AdminView({
   onLogoutAdmin,
 }: AdminViewProps) {
   const { showToast } = useToast();
-  const [activeAdminTab, setActiveAdminTab] = useState<'matches' | 'weights' | 'api' | 'teams'>('matches');
+  const [activeAdminTab, setActiveAdminTab] = useState<'matches' | 'weights' | 'api'>('matches');
 
   // Prediction weights state
   const [weights, setWeights] = useState<PredictionModelWeights>(() => getStoredWeights());
@@ -67,11 +69,23 @@ export function AdminView({
     isHotPick: false,
   });
 
-  // API settings state
-  const providerInfo = footballApiService.getProviderInfo();
-  const [apiProvider, setApiProvider] = useState<string>(providerInfo.provider);
-  const [apiKey, setApiKey] = useState<string>(providerInfo.hasApiKey ? '••••••••••••••••' : '');
-  const [apiBaseUrl, setApiBaseUrl] = useState<string>(providerInfo.baseUrl);
+  // API settings state initialized from storage
+  const [apiCredentials, setApiCredentials] = useState(() => footballApiService.getStoredCredentials());
+  const [apiProvider, setApiProvider] = useState<string>(apiCredentials.provider);
+  const [apiKey, setApiKey] = useState<string>(apiCredentials.apiKey);
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>(apiCredentials.baseUrl);
+
+  // Live Sync & Testing state
+  const [isSyncingApi, setIsSyncingApi] = useState(false);
+  const [isTestingApi, setIsTestingApi] = useState(false);
+  const [syncTargetDate, setSyncTargetDate] = useState<string>(getTodayDateString());
+  const [apiTestResult, setApiTestResult] = useState<{
+    success?: boolean;
+    message?: string;
+    error?: string;
+    latencyMs?: number;
+    matchesFound?: number;
+  } | null>(null);
 
   // Database and Supabase status state
   const [dbStatus, setDbStatus] = useState<{
@@ -157,6 +171,76 @@ export function AdminView({
     setTimeout(() => setCopiedSecret(false), 2000);
   };
 
+  // Save API Settings
+  const handleSaveApiSettings = () => {
+    footballApiService.saveCredentials(apiProvider, apiKey, apiBaseUrl);
+    setApiCredentials({ provider: apiProvider, apiKey, baseUrl: apiBaseUrl });
+    showToast(`API credentials saved (${apiProvider})`, 'success');
+  };
+
+  // Test API Connection
+  const handleTestApiConnection = async () => {
+    if (!apiKey.trim()) {
+      showToast('Please enter an API Key to test connection', 'error');
+      return;
+    }
+    setIsTestingApi(true);
+    setApiTestResult(null);
+
+    try {
+      footballApiService.saveCredentials(apiProvider, apiKey, apiBaseUrl);
+      const res = await fetch('/api/admin/test-api', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          provider: apiProvider,
+          baseUrl: apiBaseUrl.trim(),
+        }),
+      });
+
+      const json = await res.json();
+      setApiTestResult(json);
+
+      if (json.success) {
+        showToast(`API Verified! Found ${json.matchesFound || 0} fixtures (${json.latencyMs}ms)`, 'success');
+      } else {
+        showToast(`API Test Failed: ${json.error}`, 'error');
+      }
+    } catch (err: any) {
+      const errorMsg = err?.message || 'Connection error';
+      setApiTestResult({ success: false, error: errorMsg });
+      showToast(`API Test Error: ${errorMsg}`, 'error');
+    } finally {
+      setIsTestingApi(false);
+    }
+  };
+
+  // Live Sync Fixtures from API
+  const handleSyncLiveFixtures = async () => {
+    setIsSyncingApi(true);
+    try {
+      footballApiService.saveCredentials(apiProvider, apiKey, apiBaseUrl);
+      const result = await footballApiService.syncLiveFixtures({
+        date: syncTargetDate,
+        apiKey: apiKey.trim(),
+        provider: apiProvider,
+        mode: 'live',
+      });
+
+      if (result.success && result.matches && result.matches.length > 0) {
+        onRefreshMatches();
+        showToast(`Successfully synced ${result.total} real fixtures for ${syncTargetDate} from ${result.source}!`, 'success');
+      } else {
+        showToast(`API sync failed: ${result.error || 'No fixtures found for this date. Check API key and quota.'}`, 'error');
+      }
+    } catch (err: any) {
+      showToast(`Sync error: ${err.message || 'Network error'}`, 'error');
+    } finally {
+      setIsSyncingApi(false);
+    }
+  };
+
   // Handle weight change
   const handleWeightChange = (field: keyof PredictionModelWeights, value: number) => {
     setWeights((prev) => ({
@@ -193,11 +277,30 @@ export function AdminView({
     showToast('Reset to default algorithmic weights (25/20/15/15/10/10/5)', 'info');
   };
 
+  // Delete single match
   const handleDeleteMatch = async (id: string) => {
     if (confirm('Are you sure you want to delete this match fixture?')) {
       await footballDataStore.deleteMatch(id);
       onRefreshMatches();
       showToast('Match deleted successfully', 'warning');
+    }
+  };
+
+  // Delete ALL matches / Clear Demo Data
+  const handleDeleteAllMatches = async () => {
+    if (confirm('Are you sure you want to delete ALL match fixtures? This will clear all demo data and leave an empty fixture list.')) {
+      await footballDataStore.clearAllMatches();
+      onRefreshMatches();
+      showToast('All demo and match fixtures deleted successfully', 'warning');
+    }
+  };
+
+  // Restore factory demo matches
+  const handleResetAllData = async () => {
+    if (confirm('Restore standard factory demo fixtures and historical database?')) {
+      await footballDataStore.resetToDefaults();
+      onRefreshMatches();
+      showToast('Restored default demo fixtures', 'info');
     }
   };
 
@@ -278,14 +381,6 @@ export function AdminView({
     onRefreshMatches();
   };
 
-  const handleResetAllData = async () => {
-    if (confirm('Reset entire football database back to factory demo state?')) {
-      await footballDataStore.resetToDefaults();
-      onRefreshMatches();
-      showToast('Database reset to defaults', 'info');
-    }
-  };
-
   return (
     <div className="space-y-8 pb-16">
       {/* Admin Top Header */}
@@ -302,7 +397,7 @@ export function AdminView({
               </Badge>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Manage live fixtures, re-tune algorithmic weighting, and configure API endpoints
+              Manage live fixtures, delete demo records, sync external APIs, and re-tune weights
             </p>
           </div>
         </div>
@@ -310,9 +405,11 @@ export function AdminView({
         <div className="flex items-center gap-2">
           <button
             onClick={handleResetAllData}
-            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-slate-400 hover:text-white border border-slate-800"
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-slate-400 hover:text-white border border-slate-800 flex items-center gap-1.5"
+            title="Restore default mock matches"
           >
-            Reset All Demo Data
+            <RotateCcw className="w-3.5 h-3.5" />
+            Restore Demo Data
           </button>
           <button
             onClick={onLogoutAdmin}
@@ -363,83 +460,171 @@ export function AdminView({
       {/* TAB 1: Matches Manager */}
       {activeAdminTab === 'matches' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-base font-bold text-white">Database Matches & Fixtures</h3>
-              <p className="text-xs text-slate-400">Add, edit, or remove fixtures and recalculate their model outputs</p>
+          {/* Quick API Sync Toolbar */}
+          <div className="bg-slate-900/90 border border-slate-800 p-4 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                Live API Sync:
+              </span>
+              <button
+                onClick={() => setSyncTargetDate(getTodayDateString())}
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium border ${
+                  syncTargetDate === getTodayDateString()
+                    ? 'bg-purple-950 border-purple-500 text-purple-200'
+                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                Today ({getTodayDateString()})
+              </button>
+              <button
+                onClick={() => setSyncTargetDate(getTomorrowDateString())}
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium border ${
+                  syncTargetDate === getTomorrowDateString()
+                    ? 'bg-purple-950 border-purple-500 text-purple-200'
+                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                Tomorrow ({getTomorrowDateString()})
+              </button>
+              <input
+                type="date"
+                value={syncTargetDate}
+                onChange={(e) => setSyncTargetDate(e.target.value)}
+                className="py-1 px-2 text-xs bg-slate-950 border border-slate-700 rounded-lg text-white"
+              />
+              <button
+                onClick={handleSyncLiveFixtures}
+                disabled={isSyncingApi}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white transition-all disabled:opacity-50"
+              >
+                <CloudDownload className={`w-3.5 h-3.5 ${isSyncingApi ? 'animate-bounce' : ''}`} />
+                {isSyncingApi ? 'Syncing Real Matches...' : 'Fetch Live Matches from API'}
+              </button>
             </div>
-            <button
-              id="btn-add-match"
-              onClick={handleOpenAddMatch}
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-950/40 transition-all"
-            >
-              <Plus className="w-4 h-4" />
-              Add Match Fixture
-            </button>
+
+            <div className="flex items-center gap-2 self-end md:self-auto">
+              <button
+                onClick={handleDeleteAllMatches}
+                disabled={matches.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/60 transition-all disabled:opacity-40"
+                title="Delete all demo match records"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete All Matches (Clear Demo)
+              </button>
+              <button
+                id="btn-add-match"
+                onClick={handleOpenAddMatch}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-500 text-white shadow-md transition-all"
+              >
+                <Plus className="w-4 h-4" />
+                Add Fixture
+              </button>
+            </div>
           </div>
 
-          <div className="bg-[#0F172A] border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-900/90 border-b border-slate-800 text-slate-400 uppercase text-[10px] tracking-wider font-semibold">
-                  <tr>
-                    <th className="py-3 px-4">Matchup</th>
-                    <th className="py-3 px-4">League</th>
-                    <th className="py-3 px-4">Date & Time</th>
-                    <th className="py-3 px-4">Forecast Pick</th>
-                    <th className="py-3 px-4">Score</th>
-                    <th className="py-3 px-4">Confidence</th>
-                    <th className="py-3 px-4">Flags</th>
-                    <th className="py-3 px-4 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/60 text-slate-200">
-                  {matches.map((m) => (
-                    <tr key={m.id} className="hover:bg-slate-800/40 transition-colors">
-                      <td className="py-3.5 px-4 font-bold text-white">
-                        {m.homeTeam.name} vs {m.awayTeam.name}
-                      </td>
-                      <td className="py-3.5 px-4 text-slate-400">{m.leagueName}</td>
-                      <td className="py-3.5 px-4 text-slate-400">
-                        {m.date} {m.kickoffTime}
-                      </td>
-                      <td className="py-3.5 px-4">
-                        <span className="px-2 py-0.5 rounded bg-purple-950 text-purple-300 font-semibold text-[11px]">
-                          {m.prediction.primaryPrediction}
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 font-mono font-bold text-white">{m.prediction.predictedScore}</td>
-                      <td className="py-3.5 px-4 text-slate-300 font-semibold">{m.prediction.confidence}%</td>
-                      <td className="py-3.5 px-4 space-x-1">
-                        {m.isFeatured && <Badge variant="primary" size="sm">Featured</Badge>}
-                        {m.isHotPick && <Badge variant="cyan" size="sm">Hot</Badge>}
-                      </td>
-                      <td className="py-3.5 px-4 text-right space-x-2">
-                        <button
-                          onClick={() => handleOpenEditMatch(m)}
-                          className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700"
-                          title="Edit Match"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleDeleteMatch(m.id)}
-                          className="p-1.5 rounded-lg bg-slate-800 text-rose-400 hover:text-rose-300 hover:bg-rose-950/60"
-                          title="Delete Match"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          {/* Matches List or Empty State */}
+          {matches.length === 0 ? (
+            <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-12 text-center space-y-4 shadow-xl">
+              <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-500 mx-auto">
+                <AlertTriangle className="w-7 h-7 text-amber-400" />
+              </div>
+              <div className="max-w-md mx-auto space-y-1">
+                <h4 className="text-base font-bold text-white">No Match Fixtures in Database</h4>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  All demo fixtures have been cleared. You can fetch live real-world matches from your configured football API, schedule manual fixtures, or restore standard demo data.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                <button
+                  onClick={handleSyncLiveFixtures}
+                  disabled={isSyncingApi}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white"
+                >
+                  <CloudDownload className="w-4 h-4" />
+                  Fetch Real Matches from Live API
+                </button>
+                <button
+                  onClick={handleOpenAddMatch}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Custom Fixture
+                </button>
+                <button
+                  onClick={handleResetAllData}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  Restore Factory Demo
+                </button>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="bg-[#0F172A] border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-900/90 border-b border-slate-800 text-slate-400 uppercase text-[10px] tracking-wider font-semibold">
+                    <tr>
+                      <th className="py-3 px-4">Matchup</th>
+                      <th className="py-3 px-4">League</th>
+                      <th className="py-3 px-4">Date & Time</th>
+                      <th className="py-3 px-4">Forecast Pick</th>
+                      <th className="py-3 px-4">Score</th>
+                      <th className="py-3 px-4">Confidence</th>
+                      <th className="py-3 px-4">Flags</th>
+                      <th className="py-3 px-4 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 text-slate-200">
+                    {matches.map((m) => (
+                      <tr key={m.id} className="hover:bg-slate-800/40 transition-colors">
+                        <td className="py-3.5 px-4 font-bold text-white">
+                          {m.homeTeam.name} vs {m.awayTeam.name}
+                        </td>
+                        <td className="py-3.5 px-4 text-slate-400">{m.leagueName}</td>
+                        <td className="py-3.5 px-4 text-slate-400">
+                          {m.date} {m.kickoffTime}
+                        </td>
+                        <td className="py-3.5 px-4">
+                          <span className="px-2 py-0.5 rounded bg-purple-950 text-purple-300 font-semibold text-[11px]">
+                            {m.prediction.primaryPrediction}
+                          </span>
+                        </td>
+                        <td className="py-3.5 px-4 font-mono font-bold text-white">{m.prediction.predictedScore}</td>
+                        <td className="py-3.5 px-4 text-slate-300 font-semibold">{m.prediction.confidence}%</td>
+                        <td className="py-3.5 px-4 space-x-1">
+                          {m.isFeatured && <Badge variant="primary" size="sm">Featured</Badge>}
+                          {m.isHotPick && <Badge variant="cyan" size="sm">Hot</Badge>}
+                        </td>
+                        <td className="py-3.5 px-4 text-right space-x-2">
+                          <button
+                            onClick={() => handleOpenEditMatch(m)}
+                            className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700"
+                            title="Edit Match"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteMatch(m.id)}
+                            className="p-1.5 rounded-lg bg-slate-800 text-rose-400 hover:text-rose-300 hover:bg-rose-950/60"
+                            title="Delete Match"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* TAB 2: Model Weights Configuration (Requirement #21) */}
+      {/* TAB 2: Model Weights Configuration */}
       {activeAdminTab === 'weights' && (
         <div className="space-y-6">
           <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
@@ -610,6 +795,113 @@ export function AdminView({
       {/* TAB 3: API & Supabase Database Configuration */}
       {activeAdminTab === 'api' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Live Football Data Provider & Connection Tester */}
+          <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6 lg:col-span-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                  <Radio className="w-5 h-5 text-cyan-400" />
+                  Live Football Data Provider Configuration
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Configure real-world football API credentials, test connections in real time, and trigger on-demand syncs.
+                </p>
+              </div>
+              <Badge variant={apiKey ? 'emerald' : 'neutral'} size="sm" className="gap-1.5">
+                <span className={`w-2 h-2 rounded-full ${apiKey ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+                {apiKey ? 'API Key Stored' : 'No Key (Demo Mode)'}
+              </Badge>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+              <div className="space-y-1.5">
+                <label className="font-bold text-slate-300">Active Provider</label>
+                <select
+                  value={apiProvider}
+                  onChange={(e) => {
+                    const p = e.target.value;
+                    setApiProvider(p);
+                    if (p === 'football-data') {
+                      setApiBaseUrl('https://api.football-data.org/v4');
+                    } else if (p === 'api-football') {
+                      setApiBaseUrl('https://v3.football.api-sports.io');
+                    }
+                  }}
+                  className="w-full py-2.5 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white focus:outline-hidden"
+                >
+                  <option value="api-football">API-Football (v3.football.api-sports.io)</option>
+                  <option value="football-data">Football-Data.org API (v4)</option>
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="font-bold text-slate-300">API Endpoint Base URL</label>
+                <input
+                  type="text"
+                  value={apiBaseUrl}
+                  onChange={(e) => setApiBaseUrl(e.target.value)}
+                  className="w-full py-2.5 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="font-bold text-slate-300">API Secret Key / Token</label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="Paste external API Key here"
+                  className="w-full py-2.5 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono"
+                />
+              </div>
+            </div>
+
+            {/* Test result status bar */}
+            {apiTestResult && (
+              <div
+                className={`p-3.5 rounded-xl border text-xs flex items-center justify-between ${
+                  apiTestResult.success
+                    ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300'
+                    : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <Wifi className="w-4 h-4" />
+                  <span>{apiTestResult.message || apiTestResult.error}</span>
+                </div>
+                {apiTestResult.latencyMs && (
+                  <span className="font-mono text-[11px] opacity-80">{apiTestResult.latencyMs}ms latency</span>
+                )}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-3 pt-2">
+              <button
+                onClick={handleSaveApiSettings}
+                className="px-4 py-2.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 flex items-center gap-1.5"
+              >
+                <Save className="w-3.5 h-3.5" />
+                Save Credentials
+              </button>
+              <button
+                onClick={handleTestApiConnection}
+                disabled={isTestingApi}
+                className="px-4 py-2.5 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-500 text-white flex items-center gap-1.5 shadow-md disabled:opacity-50"
+              >
+                <Wifi className={`w-3.5 h-3.5 ${isTestingApi ? 'animate-spin' : ''}`} />
+                {isTestingApi ? 'Testing Connection...' : 'Test Connection'}
+              </button>
+              <button
+                onClick={handleSyncLiveFixtures}
+                disabled={isSyncingApi}
+                className="px-5 py-2.5 rounded-xl text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white flex items-center gap-1.5 shadow-md disabled:opacity-50"
+              >
+                <CloudDownload className={`w-3.5 h-3.5 ${isSyncingApi ? 'animate-bounce' : ''}`} />
+                {isSyncingApi ? 'Fetching Real Matches...' : 'Fetch Live Fixtures Now'}
+              </button>
+            </div>
+          </div>
+
           {/* Supabase Database Connection & Migration */}
           <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
             <div className="flex items-center justify-between">
@@ -675,11 +967,8 @@ export function AdminView({
               <div className="space-y-1 bg-slate-900/60 p-3 rounded-xl border border-slate-800/80">
                 <span className="text-[11px] font-bold text-slate-300 block">Supabase Connection String Format:</span>
                 <code className="text-[10px] text-slate-400 font-mono block break-all bg-slate-950 p-2 rounded-lg border border-slate-800">
-                  postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres?pgbouncer=true
+                  postgresql://postgres:[password]@db.eexdmzizvoperynomsdg.supabase.co:5432/postgres
                 </code>
-                <span className="text-[10px] text-slate-500 block pt-1">
-                  Configure DATABASE_URL in Vercel or environment variables to activate persistent cloud storage.
-                </span>
               </div>
             </div>
           </div>
@@ -751,72 +1040,6 @@ export function AdminView({
                     <span className="text-[10px] text-purple-400 font-sans">Daily</span>
                   </div>
                 </div>
-                <span className="text-[10px] text-slate-500 block">
-                  Authenticate via header <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code> or URL query <code>?key=&lt;CRON_SECRET&gt;</code>.
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Third Party Football Provider */}
-          <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6 lg:col-span-2 max-w-2xl">
-            <div>
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Sliders className="w-5 h-5 text-cyan-400" />
-                Football Data Provider Configuration
-              </h3>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Switch seamlessly between internal demo data engine and third-party REST sports endpoints.
-              </p>
-            </div>
-
-            <div className="space-y-4 text-xs">
-              <div className="space-y-1.5">
-                <label className="font-bold text-slate-300">Active Provider</label>
-                <select
-                  value={apiProvider}
-                  onChange={(e) => setApiProvider(e.target.value)}
-                  className="w-full py-2 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white focus:outline-hidden"
-                >
-                  <option value="demo">Built-in Demo Simulation (No external key required)</option>
-                  <option value="api-football">API-Football (v3.football.api-sports.io)</option>
-                  <option value="football-data">Football-Data.org API</option>
-                </select>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="font-bold text-slate-300">API Endpoint Base URL</label>
-                <input
-                  type="text"
-                  value={apiBaseUrl}
-                  onChange={(e) => setApiBaseUrl(e.target.value)}
-                  className="w-full py-2 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="font-bold text-slate-300">API Secret Key</label>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="Paste external API Key here (or configure via .env)"
-                  className="w-full py-2 px-3 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono"
-                />
-                <span className="text-[10px] text-slate-500 block">
-                  Keys can also be provided securely in container environment variables via FOOTBALL_API_KEY.
-                </span>
-              </div>
-
-              <div className="pt-2 flex items-center gap-3">
-                <button
-                  onClick={() => {
-                    showToast('Settings saved. Ready for external sync when credentials are live.', 'success');
-                  }}
-                  className="px-4 py-2 rounded-xl text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white"
-                >
-                  Save API Settings
-                </button>
               </div>
             </div>
           </div>

@@ -3,7 +3,7 @@
  * Follows the Vercel Serverless caching and API rate limit management requirements.
  */
 
-import { getDbPool } from './db';
+import { getDbPool, markDbUnhealthy } from './db';
 
 // Fallback in-memory cache for serverless environments without active PostgreSQL
 interface MemoryCacheEntry {
@@ -39,8 +39,8 @@ export async function getCachedData<T = any>(cacheKey: string): Promise<T | null
       if (res.rows.length > 0) {
         return res.rows[0].data as T;
       }
-    } catch (err) {
-      console.warn('DB cache fetch error, falling back to memory cache:', err);
+    } catch (err: any) {
+      markDbUnhealthy(err);
     }
   }
 
@@ -62,7 +62,7 @@ export async function setCachedData(cacheKey: string, data: any, ttlSeconds: num
   // Store in memory
   memoryCache.set(cacheKey, { data, expiresAt: expiresAtMs });
 
-  // Store in PostgreSQL if configured
+  // Store in PostgreSQL if configured and healthy
   const pool = getDbPool();
   if (pool) {
     try {
@@ -73,8 +73,8 @@ export async function setCachedData(cacheKey: string, data: any, ttlSeconds: num
          DO UPDATE SET data = $2, expires_at = $3, created_at = NOW()`,
         [cacheKey, JSON.stringify(data), expiresAtDate]
       );
-    } catch (err) {
-      console.warn('DB cache store error:', err);
+    } catch (err: any) {
+      markDbUnhealthy(err);
     }
   }
 }
@@ -98,14 +98,14 @@ export async function logApiUsage(
          VALUES ($1, $2, $3, $4, $5, $6)`,
         [endpoint, status, responseTime, success, error || null, provider]
       );
-    } catch (err) {
-      console.warn('DB API usage logging error:', err);
+    } catch (err: any) {
+      markDbUnhealthy(err);
     }
   }
 
   // Memory fallback
   memoryUsageLogs.unshift({
-    id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+    id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     timestamp: new Date().toISOString(),
     endpoint,
     status,
@@ -155,8 +155,8 @@ export async function getApiUsageSummary(): Promise<{
         avgResponseTimeMs: Math.round(parseFloat(row.avg_response_time || '180')),
         recentLogs: logsRes.rows || [],
       };
-    } catch (err) {
-      console.warn('DB usage summary error, using memory logs:', err);
+    } catch (err: any) {
+      markDbUnhealthy(err);
     }
   }
 

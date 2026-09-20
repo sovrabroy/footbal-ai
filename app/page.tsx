@@ -27,6 +27,12 @@ function MainApp() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Admin authentication state
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [isAdminLoginModalOpen, setIsAdminLoginModalOpen] = useState(false);
+  const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [adminError, setAdminError] = useState('');
+
   // Data states initialized from in-memory store with lazy initializers
   const [matches, setMatches] = useState<Match[]>(() => footballDataStore.getMatchesSync());
   const [leagues, setLeagues] = useState<League[]>(() => leagueService.getAllLeaguesSync());
@@ -41,19 +47,28 @@ function MainApp() {
   const [fixturesSource, setFixturesSource] = useState<'api-football' | 'baseline'>('baseline');
   const [isLoadingFixtures, setIsLoadingFixtures] = useState(false);
 
-  // Fetch real matches from /api/fixtures on mount
+  // Reload data on admin updates (deletions, additions, live sync)
+  const handleRefreshData = useCallback(async () => {
+    const currentMatches = await footballDataStore.getMatches();
+    setMatches([...currentMatches]);
+    const fetchedResults = await footballApiService.getPredictionResults();
+    setResults([...fetchedResults]);
+  }, []);
+
+  // Fetch real matches from /api/fixtures on demand
   const handleRefreshLiveFixtures = useCallback(async () => {
     setIsLoadingFixtures(true);
     try {
-      const result = await footballApiService.fetchMatches();
-      if (result.matches && result.matches.length > 0) {
+      const result = await footballApiService.syncLiveFixtures({ mode: 'live' });
+      if (result.success && result.matches && result.matches.length > 0) {
         setMatches([...result.matches]);
-        const src = result.source === 'api-football' ? 'api-football' : 'baseline';
-        setFixturesSource(src);
-        if (src === 'api-football') {
-          showToast(`Synced ${result.total} real fixtures for today!`, 'success');
-        } else {
-          showToast(`Loaded ${result.total} match fixtures`, 'info');
+        setFixturesSource('api-football');
+        showToast(`Synced ${result.total} real fixtures from live API!`, 'success');
+      } else {
+        const fallback = await footballDataStore.getMatches();
+        setMatches([...fallback]);
+        if (result.error) {
+          showToast(`Live API: ${result.error}`, 'info');
         }
       }
     } catch (err) {
@@ -70,18 +85,21 @@ function MainApp() {
       setIsLoadingFixtures(true);
       try {
         const stored = footballDataStore.loadStoredData();
-        if (isMounted && stored.matches && stored.matches.length > 0) {
+        if (isMounted && stored.matches !== undefined) {
           setMatches(stored.matches);
         }
         if (isMounted && stored.results && stored.results.length > 0) {
           setResults(stored.results);
         }
 
-        const result = await footballApiService.fetchMatches();
-        if (isMounted && result.matches && result.matches.length > 0) {
-          setMatches([...result.matches]);
-          const src = result.source === 'api-football' ? 'api-football' : 'baseline';
-          setFixturesSource(src);
+        const creds = footballApiService.getStoredCredentials();
+        if (creds.apiKey) {
+          const result = await footballApiService.fetchMatches();
+          if (isMounted && result.matches && result.matches.length > 0) {
+            setMatches([...result.matches]);
+            const src = result.source === 'api-football' ? 'api-football' : 'baseline';
+            setFixturesSource(src);
+          }
         }
       } catch (err) {
         console.warn('Failed to load initial fixtures:', err);
@@ -98,19 +116,6 @@ function MainApp() {
       isMounted = false;
     };
   }, []);
-
-  // Admin authentication state
-  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
-  const [isAdminLoginModalOpen, setIsAdminLoginModalOpen] = useState(false);
-  const [adminPasswordInput, setAdminPasswordInput] = useState('');
-  const [adminError, setAdminError] = useState('');
-
-  // Reload data on admin updates
-  const handleRefreshData = useCallback(async () => {
-    await handleRefreshLiveFixtures();
-    const fetchedResults = await footballApiService.getPredictionResults();
-    setResults([...fetchedResults]);
-  }, [handleRefreshLiveFixtures]);
 
   // Open match analysis
   const handleViewAnalysis = (match: Match) => {
@@ -131,8 +136,8 @@ function MainApp() {
   // Quick Admin Login
   const handleAdminLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    // Default admin pass for demo control is "admin123" or empty submission for demo convenience
-    if (adminPasswordInput === 'admin123' || adminPasswordInput.toLowerCase() === 'admin' || adminPasswordInput === '') {
+    const correctPassword = process.env.NEXT_PUBLIC_ADMIN_PASSWORD || 'Bangladesh102';
+    if (adminPasswordInput === correctPassword) {
       setIsAdminAuthenticated(true);
       setIsAdminLoginModalOpen(false);
       setAdminPasswordInput('');
@@ -140,7 +145,7 @@ function MainApp() {
       setActiveTab('admin');
       showToast('Welcome to GoalPredict AI Admin Panel', 'success');
     } else {
-      setAdminError('Invalid passcode. Use "admin123" or click Quick Access.');
+      setAdminError('Invalid passcode. Please enter the correct admin password.');
     }
   };
 
@@ -246,7 +251,7 @@ function MainApp() {
             <div>
               <p className="font-semibold">Secured Admin Environment</p>
               <p className="text-slate-400 text-[11px] mt-0.5">
-                Default demonstration passcode is <code className="text-purple-300 font-bold">admin123</code>.
+                Enter your administrative passcode to continue.
               </p>
             </div>
           </div>
@@ -257,7 +262,7 @@ function MainApp() {
               <Key className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="password"
-                placeholder="admin123"
+                placeholder="Enter admin password"
                 value={adminPasswordInput}
                 onChange={(e) => setAdminPasswordInput(e.target.value)}
                 className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-hidden focus:border-purple-500"

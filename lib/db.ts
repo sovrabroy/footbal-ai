@@ -1,37 +1,86 @@
 /**
  * Supabase & PostgreSQL Database Connection Pool
  * Supports Supabase Postgres (Direct & Transaction Pooler), Neon, Vercel Postgres, and standard PostgreSQL.
- * Falls back to an in-memory database store when running in environments without DATABASE_URL.
+ * Includes circuit-breaker health tracking and graceful in-memory fallback.
  */
 
 import { Pool } from 'pg';
 
 let globalPool: Pool | null = null;
+let isPoolUnhealthy = false;
+let lastUnhealthyTimestamp = 0;
+let lastHealthError: string | null = null;
+const HEALTH_COOLDOWN_MS = 30000; // 30 seconds cooldown before retrying connection after DNS/network failure
 
 export function getDbConnectionString(): string | null {
-  return (
+  const conn =
     process.env.SUPABASE_DATABASE_URL ||
     process.env.DATABASE_URL ||
     process.env.POSTGRES_URL ||
-    null
-  );
+    null;
+
+  if (!conn || conn.trim() === '' || conn.includes('[password]') || conn.includes('[project-ref]')) {
+    return null;
+  }
+  return conn.trim();
 }
 
-export function getDbPool(): Pool | null {
+export function markDbUnhealthy(error?: any): void {
+  isPoolUnhealthy = true;
+  lastUnhealthyTimestamp = Date.now();
+  if (error) {
+    lastHealthError = typeof error === 'string' ? error : error?.message || 'Database connection error';
+  }
+}
+
+export function resetDbHealth(): void {
+  isPoolUnhealthy = false;
+  lastUnhealthyTimestamp = 0;
+  lastHealthError = null;
+  if (globalPool) {
+    try {
+      globalPool.end().catch(() => {});
+    } catch {
+      // ignore
+    }
+    globalPool = null;
+  }
+}
+
+export function getDbPool(options: { force?: boolean } = {}): Pool | null {
   const connectionString = getDbConnectionString();
   if (!connectionString) {
     return null;
   }
 
+  // If in circuit-breaker cooldown and not forced, return null to use fast in-memory fallback
+  if (isPoolUnhealthy && !options.force) {
+    if (Date.now() - lastUnhealthyTimestamp < HEALTH_COOLDOWN_MS) {
+      return null;
+    }
+    // Cooldown passed, allow retry
+    isPoolUnhealthy = false;
+  }
+
   if (!globalPool) {
     const isSupabase = connectionString.includes('supabase');
-    globalPool = new Pool({
-      connectionString,
-      ssl: connectionString.includes('localhost') ? false : { rejectUnauthorized: false },
-      max: isSupabase ? 15 : 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    });
+    try {
+      globalPool = new Pool({
+        connectionString,
+        ssl: connectionString.includes('localhost') ? false : { rejectUnauthorized: false },
+        max: isSupabase ? 10 : 8,
+        idleTimeoutMillis: 20000,
+        connectionTimeoutMillis: 5000, // 5s fast timeout
+      });
+
+      // Handle idle client errors so they never crash Node.js process
+      globalPool.on('error', (err) => {
+        markDbUnhealthy(err);
+      });
+    } catch (err: any) {
+      markDbUnhealthy(err);
+      return null;
+    }
   }
 
   return globalPool;
@@ -44,11 +93,23 @@ export function getDatabaseProvider(): 'supabase' | 'postgres' | 'memory' {
   return 'postgres';
 }
 
+export function getDbHealthStatus(): { isHealthy: boolean; lastError: string | null } {
+  const conn = getDbConnectionString();
+  if (!conn) {
+    return { isHealthy: true, lastError: null };
+  }
+  const isCooldown = isPoolUnhealthy && (Date.now() - lastUnhealthyTimestamp < HEALTH_COOLDOWN_MS);
+  return {
+    isHealthy: !isCooldown,
+    lastError: isCooldown ? lastHealthError : null,
+  };
+}
+
 /**
  * Initializes required database tables if PostgreSQL is connected
  */
 export async function initializeDatabaseSchema(): Promise<boolean> {
-  const pool = getDbPool();
+  const pool = getDbPool({ force: true });
   if (!pool) return false;
 
   try {
@@ -112,12 +173,14 @@ export async function initializeDatabaseSchema(): Promise<boolean> {
           updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
       `);
+      isPoolUnhealthy = false;
+      lastHealthError = null;
       return true;
     } finally {
       client.release();
     }
-  } catch (err) {
-    console.warn('PostgreSQL schema initialization skipped / failed:', err);
+  } catch (err: any) {
+    markDbUnhealthy(err);
     return false;
   }
 }
